@@ -4,9 +4,80 @@ import torch.nn.functional as F
 import util as util
 
 
+class HPDLieBatchNorm(torch.nn.Module):
+    """Log-Euclidean 李群 Batch Normalization for HPD 矩阵。
+
+    基于 LieBN (ICLR 2024) 的 Log-Euclidean 李群结构：
+    1. logm: HPD 流形 → Hermitian 切空间
+    2. 欧氏中心化 + 可学偏置
+    3. expm: 切空间 → HPD 流形
+
+    等价于在 Log-Euclidean 度量下做黎曼 BN。
+    """
+
+    def __init__(self, dim, momentum=0.1, eps=1e-8):
+        super(HPDLieBatchNorm, self).__init__()
+        self.dim = dim
+        self.momentum = momentum
+        self.eps = eps
+
+        # 可学偏置参数 G_half (dim x dim complex)
+        # G = G_half @ G_half^H + eps * I 保证 HPD
+        G_half = torch.randn(dim, dim, dtype=torch.complex128) * 0.1
+        # 初始化为接近单位矩阵 (使 log(G) ≈ 0，初始时 BN 近似恒等)
+        G_half = G_half + torch.eye(dim, dtype=torch.complex128)
+        self.G_half = torch.nn.Parameter(G_half, requires_grad=True)
+
+        # running mean (切空间 Hermitian 矩阵)
+        self.register_buffer('running_mean', torch.zeros(dim, dim, dtype=torch.complex128))
+        self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
+
+    def _get_G(self):
+        """构造 HPD 偏置矩阵 G = G_half @ G_half^H + eps * I。"""
+        G = torch.matmul(self.G_half, self.G_half.conj().T) + self.eps * torch.eye(
+            self.dim, dtype=self.G_half.dtype, device=self.G_half.device)
+        return G
+
+    def forward(self, X):
+        """
+        Args:
+            X: (B, dim, dim) complex128 HPD 张量
+        Returns:
+            (B, dim, dim) complex128 HPD 张量
+        """
+        # 切空间映射: logm(X)
+        log_X = util.log_mat_v2(X)  # (B, dim, dim) Hermitian
+
+        if self.training:
+            # batch 均值 (欧氏均值 = Log-Euclidean Fréchet mean)
+            batch_mean = log_X.mean(dim=0)  # (dim, dim) Hermitian
+
+            # 中心化
+            log_X_c = log_X - batch_mean.unsqueeze(0)
+
+            # 更新 running mean
+            with torch.no_grad():
+                self.num_batches_tracked += 1
+                self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * batch_mean
+        else:
+            # 推理模式: 用 running mean
+            log_X_c = log_X - self.running_mean.unsqueeze(0)
+
+        # 可学偏置: log(G)
+        G = self._get_G()
+        log_G = util.log_mat_v2(G.unsqueeze(0)).squeeze(0)  # (dim, dim)
+
+        # 加偏置
+        log_X_out = log_X_c + log_G.unsqueeze(0)
+
+        # 映射回流形: expm
+        return util.exp_mat_v2(log_X_out)
+
+
 class HPDNetwork(torch.nn.Module):
     def __init__(self, in_dim=64, hidden_dims=None, rec_params=None,
-                 activations=None, rec_N_params=None, skip_resolutions=None):
+                 activations=None, rec_N_params=None, skip_resolutions=None,
+                 use_bn=True):
         super(HPDNetwork, self).__init__()
 
         if hidden_dims is None:
@@ -23,6 +94,8 @@ class HPDNetwork(torch.nn.Module):
         if skip_resolutions is None:
             # 5 个 skip 分辨率 (关于 bottleneck 对称)
             skip_resolutions = [49, 36, 25, 16, 9]
+
+        self.use_bn = use_bn  # 是否启用 LieBN
 
         # 复 Stiefel 初始化: 权重形状 (n_high, n_low), 满足 W^H W = I
         # - encoder: 用 W^H X W 下行 (n_high → n_low)
@@ -49,6 +122,11 @@ class HPDNetwork(torch.nn.Module):
 
         # encoder 层索引 → 该层输出分辨率
         enc_out_res_to_idx = {dims[i + 1]: i for i in range(len(hidden_dims))}
+
+        # Build LieBN layers for encoder (每层编码器后一个 BN)
+        self.bn_layers = torch.nn.ModuleList()
+        for i in range(len(hidden_dims)):
+            self.bn_layers.append(HPDLieBatchNorm(dims[i + 1]) if use_bn else None)
 
         # Build encoder layers: down, W^H X W + (v2 或 v3)
         # v2 调用签名: rec_mat_v2(X, eps) — 用 layer['param']
@@ -152,13 +230,16 @@ class HPDNetwork(torch.nn.Module):
         X = input
         layer_outputs = []
 
-        # Encoder: 下行 64 → 4, 每层 W^H X W + (v2 或 v3)
-        for layer in self.enc_layers:
+        # Encoder: 下行 64 → 4, 每层 W^H X W + (v2 或 v3) + LieBN
+        for idx, layer in enumerate(self.enc_layers):
             X = self._build_layer(X, layer)
             if layer['activation'] == util.rec_mat_v3:
                 X = layer['activation'](X, layer['param'], layer['N'])
             else:
                 X = layer['activation'](X, layer['param'])
+            # LieBN
+            if self.use_bn and self.bn_layers[idx] is not None:
+                X = self.bn_layers[idx](X)
             layer_outputs.append(X)
 
         # Decoder: 上行 4 → 64, 每层 线性 U^H block_diag(X, c·I) U → 多项式非线性 → skip 加法
@@ -197,6 +278,12 @@ class HPDNetwork(torch.nn.Module):
         for theta in self.poly_thetas:
             theta.data -= lr * theta.grad.data
             theta.grad.data.zero_()
+
+        # 更新 LieBN 的可学偏置 G_half (欧氏 SGD)
+        for bn in self.bn_layers:
+            if bn is not None and bn.G_half.grad is not None:
+                bn.G_half.data -= lr * bn.G_half.grad.data
+                bn.G_half.grad.data.zero_()
 
         # 清除 Stiefel 权重梯度 (顺序: 1 → n)
         for i in range(0, len(self.weights)):

@@ -561,6 +561,103 @@ class LogFunction_v2(Function):
         return grad
 
 
+class ExpFunction_v2(Function):
+
+    def forward(self, input):
+        """计算批量输入矩阵的矩阵指数（matrix exponential）。
+
+        对每个输入矩阵 X_i 执行 SVD：X_i = U_i @ diag(S_i) @ V_i^H，
+        假设 X_i 为 Hermitian 矩阵（此时 U_i ≈ V_i，S_i 为实数），
+        则其矩阵指数定义为：
+            exp(X_i) = U_i @ diag(exp(S_i)) @ U_i^H。
+
+        输入应为 Hermitian 矩阵（如 logm(HPD) 的结果），输出为 HPD 矩阵。
+
+        Args:
+            input (torch.Tensor): 输入张量，形状为 [B, N, N]，复数 Hermitian 矩阵。
+
+        Returns:
+            torch.Tensor: 矩阵指数结果，形状为 [B, N, N]，为 HPD 矩阵。
+        """
+        Us = torch.zeros_like(input)  # [B, N, N]：左奇异向量 U
+        Ss = torch.zeros((input.shape[0], input.shape[1])).double()  # [B, N]：奇异值 S
+        expSs = torch.zeros_like(input).double()  # [B, N, N]：diag(exp(S))
+
+        for i in range(input.shape[0]):
+            U, S, V = torch.linalg.svd(input[i, :, :], full_matrices=False)
+            Ss[i, :] = S
+            Us[i, :, :] = U
+            expSs[i, :, :] = torch.diag(torch.exp(S))  # diag(exp(S))
+
+        # 复矩阵重构：exp(X) = U @ diag(exp(S)) @ U^H
+        re_part_1 = torch.matmul(Us.real, torch.matmul(expSs, torch.transpose(Us.real, 1, 2)))
+        re_part_2 = torch.matmul(Us.imag, torch.matmul(expSs, torch.transpose(Us.imag, 1, 2)))
+        re_part = re_part_1 + re_part_2
+
+        im_part_1 = -torch.matmul(Us.real, torch.matmul(expSs, torch.transpose(Us.imag, 1, 2)))
+        im_part_2 = torch.matmul(Us.imag, torch.matmul(expSs, torch.transpose(Us.real, 1, 2)))
+        im_part = im_part_1 + im_part_2
+
+        result = torch.complex(re_part, im_part)
+
+        self.Us = Us
+        self.Ss = Ss
+        self.expSs = expSs
+        self.save_for_backward(input)
+
+        return result
+
+    def backward(self, grad_output):
+        """计算矩阵指数关于输入的梯度。
+
+        前向：C = exp(X) = U @ diag(exp(S)) @ U^H
+        反向：dL/dX，利用矩阵微分理论。
+        d(exp S)/dS = exp(S)，与 logm 的 1/S 对应。
+
+        Args:
+            grad_output (torch.Tensor): dL/dC, 形状 [B, N, N]。
+
+        Returns:
+            torch.Tensor: dL/dX, 形状 [B, N, N]。
+        """
+        Ks = torch.zeros_like(grad_output)  # [B, N, N]
+
+        # Step 1: 对称化 grad_output（因 exp(Hermitian) 是 Hermitian）
+        dLdC = grad_output
+        dLdC = 0.5 * (dLdC + torch.transpose(dLdC.conj(), 1, 2))
+
+        # Step 2: U^H
+        Ut = torch.transpose(self.Us.conj(), 1, 2)  # [B, N, N]
+
+        # Step 3: dLdV = 2 * dLdC @ U @ expS
+        dLdV = 2 * torch.matmul(dLdC, torch.matmul(self.Us, self.expSs.to(torch.complex128)))
+
+        # Step 4: dL/dS = U^H @ dLdC @ U，再乘以 exp(S)（链式法则: d(exp S)/dS = exp(S)）
+        dLdS_1 = torch.matmul(torch.matmul(Ut, dLdC), self.Us)
+        # 缩放：dLdS = dLdS_1 * exp(S) (逐元素对角缩放)
+        dLdS = torch.matmul(self.expSs.to(torch.complex128), dLdS_1)
+
+        # Step 5: 构建 K 矩阵
+        diag_dLdS = torch.zeros_like(grad_output)
+        for i in range(grad_output.shape[0]):
+            diagS = self.Ss[i, :].contiguous()
+            vs_1 = diagS.view(-1, 1)
+            vs_2 = diagS.view(1, -1)
+            K = 1.0 / (vs_1 - vs_2)
+            K[K >= float("Inf")] = 0.0
+            Ks[i, :, :] = K
+            diag_dLdS[i, :, :] = torch.diag(torch.diag(dLdS[i, :, :]))
+
+        # Step 6: 组合非对角与对角梯度项
+        tmp = torch.transpose(Ks.conj(), 1, 2) * torch.matmul(Ut, dLdV)
+        tmp = 0.5 * (tmp + torch.transpose(tmp.conj(), 1, 2)) + diag_dLdS
+
+        # Step 7: grad = U @ tmp @ U^H
+        grad = torch.matmul(self.Us, torch.matmul(tmp, Ut))
+
+        return grad
+
+
 def SVD_customed(input):
     return SVD_opt()(input)
 
@@ -577,6 +674,10 @@ def rec_mat_v3(input, threshold, N):
 def log_mat_v2(input):
     # return LogFunction_v2()(input)
     return LogFunction_v2.apply(input)
+
+
+def exp_mat_v2(input):
+    return ExpFunction_v2.apply(input)
 
 
 
