@@ -1,6 +1,7 @@
 # 训练脚本: U 型 HPD 自编码器
 # 任务: 输入 64x64 HPD 矩阵 X, 重建 Y = X, loss = Log-Euclidean 距离
 import os
+import argparse
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -9,6 +10,16 @@ import datetime
 
 import model
 import util
+
+# ==============================================
+# 命令行参数
+# ==============================================
+parser = argparse.ArgumentParser(description='HPD 自编码器训练')
+parser.add_argument('--bn', action='store_true', default=True,
+                    help='启用 LieBN (Log-Euclidean Riemannian BatchNorm), 默认启用')
+parser.add_argument('--no-bn', dest='bn', action='store_false',
+                    help='禁用 LieBN')
+args = parser.parse_args()
 
 # ===================== 绘图全局配置 =====================
 import matplotlib.pyplot as plt
@@ -46,11 +57,12 @@ with open(FILE_LIST_PATH, 'r') as fid:
 
 num_samples = len(file_list)
 print(f'训练样本数: {num_samples}')
+print(f'LieBN: {"启用" if args.bn else "禁用"}')
 
 # ==============================================
 # 初始化模型
 # ==============================================
-model = model.HPDNetwork()
+model = model.HPDNetwork(use_bn=args.bn)
 
 if LOAD_WEIGHT and os.path.exists(LOAD_WEIGHT_PATH):
     print(f"开始加载已有模型权重: {LOAD_WEIGHT_PATH}")
