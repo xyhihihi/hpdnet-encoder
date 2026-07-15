@@ -263,20 +263,22 @@ class RecFunction_v2(Function):
             vs_1 = diagS.view(-1, 1)  # [N, 1]
             vs_2 = diagS.view(1, -1)  # [1, N]
             K = 1.0 / (vs_1 - vs_2)  # [N, N]，差分倒数矩阵
-            K[K >= float("Inf")] = 0.0  # 处理 σ_i == σ_j 导致的 inf（设为 0）
+            K[K >= float("Inf")] = 0.0  # 处理 σ_i == σ_j 导致的 inf
+            K[K <= float("-Inf")] = 0.0
+            K = torch.nan_to_num(K, nan=0.0)
             Ks[i, :, :] = K
 
             # 提取 dLdS 的对角元素并构造对角矩阵
             diag_dLdS[i, :, :] = torch.diag(torch.diag(dLdS[i, :, :]))
 
         # Step 6: 组合非对角与对角梯度项
-        # 非对角项：K^T ⊙ (U^T @ dLdV)
+        # 非对角项：K^H ⊙ (U^H @ dLdV)
         tmp = torch.transpose(Ks.conj(), 1, 2) * torch.matmul(Ut, dLdV)
         # 对称化非对角项并加上对角项
         tmp = 0.5 * (tmp + torch.transpose(tmp.conj(), 1, 2)) + diag_dLdS
 
-        # Step 7: 将梯度变换回原始输入空间：grad = U @ tmp @ U^T
-        grad = torch.matmul(self.Us, torch.matmul(tmp, Ut))  # checked
+        # Step 7: 将梯度变换回原始输入空间：grad = U @ tmp @ U^H
+        grad = torch.matmul(self.Us, torch.matmul(tmp, Ut))
 
         grad_eps = None
 
@@ -401,7 +403,9 @@ class RecFunction_v3(Function):
             vs_1 = diagS.view(-1, 1)  # [N, 1]
             vs_2 = diagS.view(1, -1)  # [1, N]
             K = 1.0 / (vs_1 - vs_2)  # [N, N]，差分倒数矩阵
-            K[K >= float("Inf")] = 0.0  # 处理 σ_i == σ_j 导致的 inf
+            K[K >= float("Inf")] = 0.0
+            K[K <= float("-Inf")] = 0.0
+            K = torch.nan_to_num(K, nan=0.0)
             Ks[i, :, :] = K
 
             # 提取 dLdS 的对角元素并构造对角矩阵
@@ -411,7 +415,7 @@ class RecFunction_v3(Function):
         tmp = torch.transpose(Ks.conj(), 1, 2) * torch.matmul(Ut, dLdV)
         tmp = 0.5 * (tmp + torch.transpose(tmp.conj(), 1, 2)) + diag_dLdS
 
-        # Step 7: 将梯度变换回原始输入空间：grad = U @ tmp @ U^H
+        # Step 7: grad = U @ tmp @ U^H
         grad = torch.matmul(self.Us, torch.matmul(tmp, Ut))
 
         grad_threshold = None
@@ -423,140 +427,103 @@ class RecFunction_v3(Function):
 class LogFunction_v2(Function):
 
     def forward(self, input):
-        """计算批量输入矩阵的矩阵对数（matrix logarithm）。
+        """计算批量 HPD 矩阵的矩阵对数 (matrix logarithm)。
 
-        对每个输入矩阵 X_i 执行奇异值分解（SVD）：X_i = U_i @ diag(S_i) @ V_i^T，
-        并假设 X_i 为对称正定（SPD）矩阵（此时 U_i ≈ V_i，且 S_i > 0），
-        则其矩阵对数定义为：
-            log(X_i) = U_i @ diag(log(S_i)) @ U_i^T。
+        对每个 HPD 输入 X_i = U_i diag(λ_i) U_i^H (eigh 分解, λ_i > 0):
+            log(X_i) = U_i @ diag(log(λ_i)) @ U_i^H
 
-        本实现通过 SVD 近似特征分解，仅使用左奇异向量 U_i 重构对数矩阵，
-        因此输出始终为对称矩阵。要求所有奇异值严格大于 0，否则 torch.log(S) 将产生 NaN。
+        使用 eigh (而非 SVD) 因为 Hermitian 矩阵的特征值可以为负,
+        而 SVD 只给非负奇异值。eigh 与 ExpFunction_v2 保持一致。
 
         Args:
-            input (torch.Tensor): 输入张量，形状为 [B, N, N]。
-                应为对称正定矩阵（或至少为满秩实矩阵），以确保 S > 0。
+            input: (B, N, N) complex, HPD 矩阵
 
         Returns:
-            torch.Tensor: 矩阵对数结果，形状为 [B, N, N]，为对称矩阵。
-
-        Raises:
-            RuntimeError: 若输入包含非正奇异值（导致 log(S) 为 NaN 或 -inf）。
-
-        Note:
-            - 本函数不显式对称化输入，若输入非对称，结果可能不等于真实矩阵对数。
-            - 中间变量（U, S, log(S), 1/S）被缓存用于反向传播。
-            - 建议在调用前确保输入对称：input = 0.5 * (input + input.transpose(-2, -1))。
+            (B, N, N) complex, Hermitian 矩阵 (logm 结果)
         """
-        Us = torch.zeros_like(input)  # [B, N, N]：左奇异向量 U
-        Ss = torch.zeros((input.shape[0], input.shape[1])).double()  # [B, N]：奇异值 S
-        logSs = torch.zeros_like(input).double()  # [B, N, N]：diag(log(S))
-        invSs = torch.zeros_like(input).double()  # [B, N, N]：diag(1 / S)，用于 backward
+        B, N, _ = input.shape
+        Us = torch.zeros(B, N, N, dtype=input.dtype, device=input.device)  # 特征向量
+        Ls = torch.zeros(B, N, dtype=torch.double, device=input.device)    # 实特征值 λ (升序)
+        logLs = torch.zeros(B, N, N, dtype=torch.double, device=input.device)   # diag(log(λ))
+        invLs = torch.zeros(B, N, N, dtype=torch.double, device=input.device)   # diag(1/λ)
 
-        for i in range(input.shape[0]):
-            # PyTorch 的 torch.svd 不支持复数张量,需要改用 torch.linalg.svd
-            U, S, V = torch.linalg.svd(input[i, :, :], full_matrices=False)
-
-            Ss[i, :] = S
+        for i in range(B):
+            # eigh: Hermitian 矩阵特征分解, 返回实特征值 (升序) 和酉特征向量
+            L, U = torch.linalg.eigh(input[i, :, :])
+            Ls[i, :] = L.double()
             Us[i, :, :] = U
-            logSs[i, :, :] = torch.diag(torch.log(S))  # 构造对角矩阵 diag(log(S))
-            invSs[i, :, :] = torch.diag(1.0 / S)  # 构造对角矩阵 diag(1/S)
+            logLs[i, :, :] = torch.diag(torch.log(L.double()))
+            invLs[i, :, :] = torch.diag(1.0 / L.double())
 
-        re_part_1 = torch.matmul(Us.real, torch.matmul(logSs, torch.transpose(Us.real, 1, 2)))
-        re_part_2 = torch.matmul(Us.imag, torch.matmul(logSs, torch.transpose(Us.imag, 1, 2)))
-
+        # 复矩阵重构: log(X) = U @ diag(log(λ)) @ U^H
+        re_part_1 = torch.matmul(Us.real, torch.matmul(logLs, torch.transpose(Us.real, 1, 2)))
+        re_part_2 = torch.matmul(Us.imag, torch.matmul(logLs, torch.transpose(Us.imag, 1, 2)))
         re_part = re_part_1 + re_part_2
 
-        im_part_1 = - torch.matmul(Us.real, torch.matmul(logSs, torch.transpose(Us.imag, 1, 2)))
-        im_part_2 = torch.matmul(Us.imag, torch.matmul(logSs, torch.transpose(Us.real, 1, 2)))
-
+        im_part_1 = -torch.matmul(Us.real, torch.matmul(logLs, torch.transpose(Us.imag, 1, 2)))
+        im_part_2 = torch.matmul(Us.imag, torch.matmul(logLs, torch.transpose(Us.real, 1, 2)))
         im_part = im_part_1 + im_part_2
 
         result = torch.complex(re_part, im_part)
 
-        # 重构矩阵对数：log(X) ≈ U @ diag(log(S)) @ U^T
-        # result = torch.matmul(Us, torch.matmul(logSs, torch.transpose(Us.conj(), 1, 2)))
-
-        # 缓存中间结果供 backward 使用
         self.Us = Us
-        self.Ss = Ss
-        self.logSs = logSs
-        self.invSs = invSs
+        self.Ls = Ls
+        self.logLs = logLs
+        self.invLs = invLs
         self.save_for_backward(input)
 
         return result
 
     def backward(self, grad_output):
-        """计算矩阵对数（matrix logarithm）操作关于输入矩阵的梯度。
+        """计算矩阵对数 (matrix logarithm) 关于输入的梯度。
 
-        假设前向传播中对每个输入 SPD 矩阵 X_i 执行了近似特征分解：
-            X_i ≈ U_i @ diag(S_i) @ U_i^T，
-        并计算了矩阵对数：
-            C_i = log(X_i) ≈ U_i @ diag(log(S_i)) @ U_i^T。
-
-        本函数根据损失 L 对输出 C 的梯度（即 dL/dC = grad_output），
-        利用矩阵微分理论反向传播得到 dL/dX。梯度由两部分构成：
-          - 对左奇异向量 U 的敏感度（通过 K 矩阵建模非对角耦合）；
-          - 对奇异值 S 的敏感度（通过 invSs = diag(1/S) 缩放，因 d(log S)/dS = 1/S）。
+        前向: C = log(X) = U @ diag(log(λ)) @ U^H  (X HPD, eigh 分解)
+        反向: dL/dX, 利用 Daleckii-Krein 定理。
+        链式法则: d(log λ)/dλ = 1/λ。
+        K 矩阵: K_ij = 1/(λ_i - λ_j) for i≠j, 处理退化特征值。
 
         Args:
-            grad_output (torch.Tensor): 损失 L 对前向输出 C（即 log(X)）的梯度，
-                形状为 [B, N, N]。由于 C 为对称矩阵，此处先强制对称化。
+            grad_output: dL/dC, 形状 [B, N, N]。
 
         Returns:
-            torch.Tensor: 损失 L 对原始输入 X 的梯度，形状为 [B, N, N]。
-
-        Note:
-            - 输入梯度被显式对称化：dLdC = 0.5 * (G + G^T)，以匹配前向输出的对称性。
-            - 对 S 的梯度缩放因子为 1/S（来自 d(log S)/dS），由 self.invSs 提供。
-            - K 矩阵用于处理非对角项：K[i,j] = 1/(σ_i - σ_j)（i≠j），重复奇异值处设为 0。
-            - 最终梯度通过相似变换 grad = U @ tmp @ U^T 重构回原始空间。
-            - 要求所有奇异值 S > 0；否则 invSs 或 logSs 在前向已导致 NaN。
+            dL/dX, 形状 [B, N, N]。
         """
-        # 确保计算精度一致（前向使用 double）
-        # grad_output = grad_output.double()
-        Ks = torch.zeros_like(grad_output)  # [B, N, N]：差分倒数矩阵 K
+        Ks = torch.zeros_like(grad_output)  # [B, N, N]
 
-        # Step 1: 对 grad_output 对称化（因 log(X) 是对称矩阵）
+        # Step 1: 对称化 grad_output (log(HPD) 是 Hermitian)
         dLdC = grad_output
-        dLdC = 0.5 * (dLdC + torch.transpose(dLdC.conj(), 1, 2))  # checked
+        dLdC = 0.5 * (dLdC + torch.transpose(dLdC.conj(), 1, 2))
 
-        # Step 2: 获取 U^T
-        Ut = torch.transpose(self.Us.conj(), 1, 2)  # [B, N, N]
+        # Step 2: U^H
+        Ut = torch.transpose(self.Us.conj(), 1, 2)
 
-        # Step 3: 计算损失对 U 的等效梯度（记为 dLdV，命名沿用习惯）
-        # 根据 C = U @ logS @ U^T，有 ∂C/∂U = 2 * dLdC @ U @ logS
-        dLdV = 2 * torch.matmul(dLdC, torch.matmul(self.Us, self.logSs.to(torch.complex128)))  # [B, N, N]
+        # Step 3: dLdV = 2 * dLdC @ U @ diag(log(λ))
+        dLdV = 2 * torch.matmul(dLdC, torch.matmul(self.Us, self.logLs.to(self.Us.dtype)))
 
-        # Step 4: 计算损失对奇异值 S 的梯度
-        # 先计算无缩放梯度：dLdS_1 = U^T @ dLdC @ U
-        dLdS_1 = torch.matmul(torch.matmul(Ut, dLdC), self.Us)  # [B, N, N]
-        # 应用链式法则：dL/dS = (dL/d logS) * (d logS / dS) = dLdS_1 ⊙ (1/S)
-        # 由于 self.invSs 是 diag(1/S)，左乘即实现逐元素缩放对角线
-        dLdS = torch.matmul(self.invSs.to(torch.complex128), dLdS_1)  # checked
+        # Step 4: dL/dλ = U^H @ dLdC @ U, 再乘以 1/λ (链式法则)
+        dLdL_1 = torch.matmul(torch.matmul(Ut, dLdC), self.Us)
+        dLdL = torch.matmul(self.invLs.to(self.Us.dtype), dLdL_1)
 
-        # Step 5: 构建 K 矩阵并提取 dLdS 的对角部分
-        diag_dLdS = torch.zeros_like(grad_output)
+        # Step 5: 构建 K 矩阵 (使用实特征值)
+        diag_dLdL = torch.zeros_like(grad_output)
         for i in range(grad_output.shape[0]):
-            diagS = self.Ss[i, :]  # 第 i 个样本的奇异值 [N]
-            diagS = diagS.contiguous()
-            vs_1 = diagS.view(-1, 1)  # [N, 1]
-            vs_2 = diagS.view(1, -1)  # [1, N]
-            K = 1.0 / (vs_1 - vs_2)  # [N, N]，差分倒数矩阵
-            K[K >= float("Inf")] = 0.0  # 处理 σ_i == σ_j 导致的 inf（设为 0）
-            Ks[i, :, :] = K
+            diagL = self.Ls[i, :].contiguous()  # 实特征值
+            vs_1 = diagL.view(-1, 1)
+            vs_2 = diagL.view(1, -1)
+            K = 1.0 / (vs_1 - vs_2)
+            K[K >= float("Inf")] = 0.0
+            K[K <= float("-Inf")] = 0.0
+            K = torch.nan_to_num(K, nan=0.0)
+            Ks[i, :, :] = K.to(Ks.dtype)
 
-            # 提取 dLdS 的对角元素并构造对角矩阵
-            diag_dLdS[i, :, :] = torch.diag(torch.diag(dLdS[i, :, :]))
+            diag_dLdL[i, :, :] = torch.diag(torch.diag(dLdL[i, :, :]))
 
         # Step 6: 组合非对角与对角梯度项
-        # 非对角项：K^T ⊙ (U^T @ dLdV)
         tmp = torch.transpose(Ks.conj(), 1, 2) * torch.matmul(Ut, dLdV)
-        # 对称化非对角项并加上对角项
-        tmp = 0.5 * (tmp + torch.transpose(tmp.conj(), 1, 2)) + diag_dLdS
+        tmp = 0.5 * (tmp + torch.transpose(tmp.conj(), 1, 2)) + diag_dLdL
 
-        # Step 7: 将梯度变换回原始输入空间：grad = U @ tmp @ U^T
-        grad = torch.matmul(self.Us, torch.matmul(tmp, Ut))  # checked
+        # Step 7: grad = U @ tmp @ U^H
+        grad = torch.matmul(self.Us, torch.matmul(tmp, Ut))
 
         return grad
 

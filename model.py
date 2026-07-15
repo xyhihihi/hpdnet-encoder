@@ -148,8 +148,8 @@ class HPDNetwork(torch.nn.Module):
         # Build decoder layers: up, U^H block_diag(X, c·I) U + 多项式非线性 + skip; 不接 ReEig
         # c 由 pad_theta 经 softplus 保正; 初始 c=1
         # 多项式 a0I + a1Z + a2Z² 由 poly_theta (3,) 参数化, 正系数保 HPD; 初始 ≈ Z (恒等)
-        self.pad_thetas = []
-        self.poly_thetas = []
+        self.pad_thetas = torch.nn.ParameterList()
+        self.poly_thetas = torch.nn.ParameterList()
         init_theta = math.log(math.e - 1)  # softplus(log(e-1)) = 1.0
         init_poly = torch.tensor([-10.0, -10.0, -10.0], dtype=torch.double)  # a0≈0, a1≈1, a2≈0
         self.dec_layers = []
