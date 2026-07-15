@@ -975,3 +975,114 @@ def mask_random_eigvals(X, n=16, eps=1e-8):
         # 重建 X' = U diag(ev_new) U^H = (U * ev_new[None,:]) @ U^H
         X_noisy = torch.matmul(U * ev_new.unsqueeze(-2), U.conj().transpose(-2, -1))
     return X_noisy
+
+
+def retract_hpd(G, dLdlogG, t):
+    """HPD 流形上的黎曼梯度下降 + 回缩 (Brooks 2019, NeurIPS)。
+
+    对标代码中 Stiefel 流形的 update_para_riemann (cal_riemann_grad + cal_retraction),
+    本函数在 HPD (Hermitian Positive Definite) 流形上执行一步黎曼梯度下降。
+
+    度量: 仿射不变黎曼度量 (Affine-Invariant Metric, AIM)
+        g_G(U, V) = tr(G^{-1} U G^{-1} V)
+
+    整体流程 (类比 update_para_riemann):
+      1. 从切空间梯度 dL/d(logG) 算出 G 的欧氏梯度 dL/dG
+         (通过 logm 的 Fréchet 导数, Daleckii-Krein 定理)
+      2. 黎曼梯度投影: grad_R = G @ (dL/dG) @ G
+         (类比 cal_riemann_grad: 欧氏梯度 → 切空间黎曼梯度)
+      3. 指数映射回缩: G_new = G^{1/2} exp(-t G^{-1/2} grad_R G^{-1/2}) G^{1/2}
+         (类比 cal_retraction: QR 回缩 → 指数映射回缩)
+      4. 重新分解 G_new = G_half_new @ G_half_new^H
+
+    与 Stiefel 版本 update_para_riemann 的对应关系:
+      ┌──────────────────────┬──────────────────────────────────┐
+      │  Stiefel (权重 W)     │  HPD (偏置 G)                    │
+      ├──────────────────────┼──────────────────────────────────┤
+      │  cal_riemann_grad     │  grad_R = G @ (dL/dG) @ G       │
+      │  cal_retraction (QR)  │  expm retraction (谱域缩放)      │
+      │  update_para_riemann  │  retract_hpd (本函数)            │
+      └──────────────────────┴──────────────────────────────────┘
+
+    Args:
+        G: (dim, dim) complex, 当前 HPD 偏置矩阵
+        dLdlogG: (dim, dim) complex, 损失对 log(G) 的梯度 (Hermitian)
+                 即 BN 反向传播中 log_X_out 处的梯度
+        t: float, 学习率 (步长)
+
+    Returns:
+        G_half_new: (dim, dim) complex, 更新后 G_new = G_half @ G_half^H 的 Cholesky 因子
+    """
+    dim = G.shape[0]
+    device = G.device
+    dtype = G.dtype
+
+    # === Step 1: 计算 dL/dG (G 的欧氏梯度) ===
+    # logm 的 Fréchet 导数 (Daleckii-Krein 定理):
+    #   d(logG)/dG 在 G 的特征基 {V, diag(g)} 中:
+    #   [d(logG)]_{ij} = K_ij * [V^H dG V]_{ij}
+    #   K_ij = (log g_i - log g_j)/(g_i - g_j)  (i≠j), 1/g_i (i=j)
+    #
+    # 链式法则 (Hermitian 输入):
+    #   dL = <dL/dG, dG>_R = tr((dL/dG)^H dG)
+    #   推出: dL/dG = V @ E @ V^H
+    #   其中 E = (K ⊙ Ω)^H + (K ⊙ Ω) - diag(K ⊙ Ω)
+    #   Ω = V^H @ (dL/dlogG) @ V
+
+    g, V = torch.linalg.eigh(G)  # g: (dim,) real ascending; V: (dim, dim) unitary
+    g = g.real.to(dtype)  # eigh 返回实特征值
+
+    # Ω = V^H @ dLdlogG @ V
+    Vh = V.conj().T
+    Omega = Vh @ dLdlogG.to(dtype) @ V
+
+    # K 矩阵 (logm 的 divided differences)
+    g_safe = g.clamp(min=1e-15)
+    gi = g_safe.unsqueeze(1)  # (dim, 1)
+    gj = g_safe.unsqueeze(0)  # (1, dim)
+    log_gi = torch.log(g_safe).unsqueeze(1)
+    log_gj = torch.log(g_safe).unsqueeze(0)
+
+    K = torch.where(
+        (gi - gj).abs() > 1e-12,
+        (log_gi - log_gj) / (gi - gj),
+        1.0 / g_safe
+    )
+
+    # W = K ⊙ Ω (Hadamard 积)
+    W = K * Omega
+
+    # 欧氏梯度 dL/dG = V @ W^* @ V^H
+    # 推导: dL = tr(∂L/∂logG @ dlogG) = tr(W^* @ V^H dG V) (Daleckii-Krein + 循环迹)
+    # 因此 ∂L/∂G = V @ W^* @ V^H
+    # 注意: W 是 Hermitian (Schur 积定理), 故 W^* = W^T (普通转置)
+    # 特征值更新 μ_i = g_i · W_ii 只用到对角元, W^* 和 W 的对角元相同 (实数)
+    E = W.conj()  # W^* = element-wise 共轭, 对 Hermitian W 等价于 W^T
+
+    dLdG = V @ E @ Vh  # (dim, dim) 欧氏梯度
+
+    # === Step 2: 黎曼梯度 (仿射不变度量) ===
+    # grad_R = G @ (dL/dG) @ G
+    # 类比 cal_riemann_grad: 将欧氏梯度投影到流形切空间
+    grad_R = G @ dLdG @ G
+
+    # === Step 3: 指数映射回缩 ===
+    # G_new = G^{1/2} exp(-t G^{-1/2} grad_R G^{-1/2}) G^{1/2}
+    # 在 G 的特征基中简化为特征值缩放:
+    #   G^{-1/2} grad_R G^{-1/2} = V diag(μ) V^H
+    #   其中 μ_i = g_i * (V^H @ dLdG @ V)_{ii} = g_i * E_{ii}
+    #   G_new = V diag(g_i * exp(-t * μ_i)) V^H
+    # 类比 cal_retraction: QR 回缩 → 谱域指数回缩
+    mu = g_safe * E.diag().real  # (dim,) 实数
+    g_new = g_safe * torch.exp(-t * mu)  # 新特征值 (自动保正)
+
+    # 重建 G_new
+    G_new = V @ torch.diag(g_new.to(dtype)) @ Vh
+
+    # === Step 4: 重新分解 G_new = G_half @ G_half^H ===
+    # 特征分解 → 取 sqrt(特征值) 构造 G_half
+    g_new_safe = g_new.real.clamp(min=1e-15)
+    sqrt_g_new = torch.sqrt(g_new_safe)
+    G_half_new = V @ torch.diag(sqrt_g_new.to(dtype))
+
+    return G_half_new

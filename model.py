@@ -68,7 +68,11 @@ class HPDLieBatchNorm(torch.nn.Module):
         log_G = util.log_mat_v2(G.unsqueeze(0)).squeeze(0)  # (dim, dim)
 
         # 加偏置
-        log_X_out = log_X_c + log_G.unsqueeze(0)
+        # detach log_G: 阻断 G_half 的 autograd 梯度 (后面用 retract_hpd 手动更新)
+        # 保留 log_X_out 的梯度 (来自 loss 和 exp_mat_v2 反向), 用于手动计算 dL/d(logG)
+        log_X_out = log_X_c + log_G.detach().unsqueeze(0)
+        log_X_out.retain_grad()  # 非叶子张量需显式 retain, backward() 后取 .grad 用于黎曼更新
+        self.log_X_out = log_X_out  # 保存引用, backward() 后可取 .grad
 
         # 映射回流形: expm
         return util.exp_mat_v2(log_X_out)
@@ -279,11 +283,17 @@ class HPDNetwork(torch.nn.Module):
             theta.data -= lr * theta.grad.data
             theta.grad.data.zero_()
 
-        # 更新 LieBN 的可学偏置 G_half (欧氏 SGD)
+        # 更新 LieBN 的可学偏置 (HPD 流形黎曼 SGD, Brooks 2019)
+        # 对标 Stiefel 权重的 update_para_riemann (cal_riemann_grad + cal_retraction),
+        # 偏置 G 在 HPD 流形上用仿射不变度量做黎曼梯度下降 (retract_hpd)
         for bn in self.bn_layers:
-            if bn is not None and bn.G_half.grad is not None:
-                bn.G_half.data -= lr * bn.G_half.grad.data
-                bn.G_half.grad.data.zero_()
+            if bn is not None and hasattr(bn, 'log_X_out') and bn.log_X_out.grad is not None:
+                # dL/d(logG): log_G 被 broadcast 到 batch, 梯度沿 batch 维求和
+                dLdlogG = bn.log_X_out.grad.sum(dim=0)  # (dim, dim)
+                G = bn._get_G().detach()
+                G_half_new = util.retract_hpd(G, dLdlogG, lr)
+                bn.G_half.data.copy_(G_half_new)
+                bn.log_X_out = None  # 释放引用
 
         # 清除 Stiefel 权重梯度 (顺序: 1 → n)
         for i in range(0, len(self.weights)):
