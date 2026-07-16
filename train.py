@@ -37,7 +37,7 @@ os.makedirs(CURVE_SAVE_DIR, exist_ok=True)
 # ==============================================
 DATA_DIR = 'D:/data/customed/customed_64'
 FILE_LIST_PATH = 'D:/data/customed/train.txt'
-SAVE_PATH = 'tmp/customed/saved/autoencoder2.model'
+SAVE_PATH = 'tmp/customed/saved/autoencoder.model'
 LOAD_WEIGHT_PATH = SAVE_PATH
 LOAD_WEIGHT = False
 
@@ -100,13 +100,13 @@ for epoch in range(EPOCHS):
         X = torch.from_numpy(batch_data).to(torch.complex128)
         X.requires_grad = False
 
-        # # 输入损坏：denoising AE，每个样本随机压 n 个特征值到 eps；目标仍是干净 X
-        # X_noisy = util.mask_random_eigvals(X,8,1e-8)
-        # # 前向
-        # Y, _ = model(X_noisy)
+        # 输入损坏：denoising AE，每个样本随机压 n 个特征值到 eps；目标仍是干净 X
+        X_noisy = util.mask_random_eigvals(X,8,1e-8)
+        # 前向
+        Y, _ = model(X_noisy)
 
         # 前向
-        Y, _ = model(X)
+        # Y, _ = model(X)
 
         # Log-Euclidean loss: ||logm(Y) - logm(X)||_F^2, mean reduction
         log_Y = util.log_mat_v2(Y)

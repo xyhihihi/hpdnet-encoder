@@ -997,7 +997,7 @@ def retract_hpd(G, dLdlogG, t):
     #   Ω = V^H @ (dL/dlogG) @ V
 
     g, V = torch.linalg.eigh(G)  # g: (dim,) real ascending; V: (dim, dim) unitary
-    g = g.real.to(dtype)  # eigh 返回实特征值
+    g = g.real.to(torch.float64)  # eigh 返回实特征值, 保持实数类型以支持 clamp
 
     # Ω = V^H @ dLdlogG @ V
     Vh = V.conj().T
