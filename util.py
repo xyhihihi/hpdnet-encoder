@@ -561,6 +561,76 @@ class LogFunction_v2(Function):
         return grad
 
 
+class ExpFunction_v2(Function):
+    """批量 Hermitian 矩阵的矩阵指数 (matrix exponential), 支持复数 + 手写反向。
+
+    前向: 对每个 Hermitian 输入 X_i 做特征分解 X_i = U_i diag(λ_i) U_i^H (eigh),
+          exp(X_i) = U_i diag(exp(λ_i)) U_i^H。结果为 HPD 矩阵。
+    反向: Daleckii-Krein / Loewner 公式。对 C = U f(Λ) U^H (f=exp):
+          dL/dX = U [ Lw ⊙ (U^H · herm(dL/dC) · U) ] U^H,
+          其中 Loewner 矩阵 Lw_ij = (f(λ_i)-f(λ_j))/(λ_i-λ_j) (i≠j), f'(λ_i)=exp(λ_i) (对角/退化)。
+
+    与 LogFunction_v2 互逆: exp_mat_v2(log_mat_v2(X)) ≈ X (X HPD)。
+    用 eigh (而非 SVD) 因为切空间 Hermitian 矩阵特征值可为负, SVD 只给非负奇异值。
+    """
+
+    def forward(self, input):
+        B, N, _ = input.shape
+        Us = torch.zeros_like(input)                                  # [B,N,N] 特征向量 (酉)
+        Ls = torch.zeros((B, N), dtype=torch.double, device=input.device)      # [B,N] 实特征值
+        expLs = torch.zeros((B, N, N), dtype=torch.double, device=input.device)  # [B,N,N] diag(exp(λ))
+
+        for i in range(B):
+            L, U = torch.linalg.eigh(input[i, :, :])  # L: (N,) real 升序, U: (N,N) 复酉
+            Ls[i, :] = L.double()
+            Us[i, :, :] = U
+            expLs[i, :, :] = torch.diag(torch.exp(L.double()))
+
+        # 复矩阵重构: exp(X) = U diag(exp λ) U^H
+        re_part_1 = torch.matmul(Us.real, torch.matmul(expLs, torch.transpose(Us.real, 1, 2)))
+        re_part_2 = torch.matmul(Us.imag, torch.matmul(expLs, torch.transpose(Us.imag, 1, 2)))
+        re_part = re_part_1 + re_part_2
+
+        im_part_1 = - torch.matmul(Us.real, torch.matmul(expLs, torch.transpose(Us.imag, 1, 2)))
+        im_part_2 = torch.matmul(Us.imag, torch.matmul(expLs, torch.transpose(Us.real, 1, 2)))
+        im_part = im_part_1 + im_part_2
+
+        result = torch.complex(re_part, im_part)
+
+        self.Us = Us
+        self.Ls = Ls
+        return result
+
+    def backward(self, grad_output):
+        Us = self.Us
+        Ut = torch.transpose(Us.conj(), 1, 2)  # U^H
+
+        # 对称化 (exp(Hermitian) 是 Hermitian, 其梯度也应 Hermitian)
+        dLdC = 0.5 * (grad_output + torch.transpose(grad_output.conj(), 1, 2))
+
+        # M = U^H dLdC U (特征基下的梯度)
+        M = torch.matmul(torch.matmul(Ut, dLdC), Us)  # [B,N,N] complex
+
+        B, N, _ = grad_output.shape
+        grad = torch.zeros_like(grad_output)
+        for i in range(B):
+            lam = self.Ls[i, :]                 # (N,) real
+            explam = torch.exp(lam)             # (N,) real
+            li = lam.view(-1, 1)
+            lj = lam.view(1, -1)
+            fi = explam.view(-1, 1)
+            fj = explam.view(1, -1)
+            denom = li - lj
+            # Loewner 矩阵: 非退化用差商, 退化 (λ_i≈λ_j) 用导数 f'(λ_i)=exp(λ_i)
+            Lw = torch.where(denom.abs() > 1e-12, (fi - fj) / denom, fi)
+            tmp = Lw.to(M.dtype) * M[i, :, :]
+            grad[i, :, :] = torch.matmul(Us[i, :, :], torch.matmul(tmp, Ut[i, :, :]))
+
+        # Hermitian 化
+        grad = 0.5 * (grad + torch.transpose(grad.conj(), 1, 2))
+        return grad
+
+
 def SVD_customed(input):
     return SVD_opt()(input)
 
@@ -577,6 +647,139 @@ def rec_mat_v3(input, threshold, N):
 def log_mat_v2(input):
     # return LogFunction_v2()(input)
     return LogFunction_v2.apply(input)
+
+
+def exp_mat_v2(input):
+    """批量 Hermitian 矩阵指数 (与 log_mat_v2 互逆)。见 ExpFunction_v2。"""
+    return ExpFunction_v2.apply(input)
+
+
+# =====================================================================
+# HPD (Hermitian Positive Definite) 流形工具 (Brooks 2019, NeurIPS)
+# 仿射不变度量 (Affine-Invariant Metric, AIM):
+#   g_P(U, V) = tr(P^{-1} U P^{-1} V)
+# 全部基于 log_mat_v2 / exp_mat_v2 + matmul 构建, autograd 可导 (手写反向)。
+# =====================================================================
+
+def sqrtm_hpd(A):
+    """HPD 矩阵平方根 A^{1/2} = exp(0.5 log A)。A: (B,n,n) HPD。"""
+    return exp_mat_v2(0.5 * log_mat_v2(A))
+
+
+def invsqrtm_hpd(A):
+    """HPD 矩阵逆平方根 A^{-1/2} = exp(-0.5 log A)。A: (B,n,n) HPD。"""
+    return exp_mat_v2(-0.5 * log_mat_v2(A))
+
+
+def hpd_congruence(P_half, X):
+    """同余变换 P_half @ X @ P_half^H。P_half, X HPD 时结果 HPD (保流形)。
+
+    Args:
+        P_half: (n,n) 或 (B,n,n) complex, 通常是某 HPD 矩阵的平方根/逆平方根
+        X:      (B,n,n) complex HPD
+    Returns:
+        (B,n,n) complex HPD
+    """
+    if P_half.dim() == 2:
+        P_half = P_half.unsqueeze(0)
+    P_half_H = P_half.conj().transpose(-2, -1)
+    out = torch.matmul(torch.matmul(P_half, X), P_half_H)
+    # Hermitian 化, 抵消数值误差
+    return 0.5 * (out + out.conj().transpose(-2, -1))
+
+
+def hpd_karcher_mean(X, iters=1, eps=1e-10):
+    """批量 HPD 矩阵在仿射不变度量下的 Fréchet/Karcher 均值 (Karcher 流)。
+
+    Brooks 2019 的 Riemannian 居中需要 batch 的黎曼重心 B。用 Karcher 流迭代:
+        B ← B^{1/2} exp( (1/N) Σ_i log(B^{-1/2} X_i B^{-1/2}) ) B^{1/2}
+    从 B_0 = 欧氏均值 (对角占优, HPD) 起步, 通常 1~几步即可。
+
+    Args:
+        X:     (B,n,n) complex HPD
+        iters: Karcher 流迭代步数 (默认 1, 已足够稳定; 增大更精确)
+    Returns:
+        (n,n) complex HPD, batch 的黎曼均值 (无梯度; 居中用 detach 的统计量)
+    """
+    with torch.no_grad():
+        B = X.mean(dim=0)                              # 欧氏均值作为初值 (HPD)
+        B = 0.5 * (B + B.conj().transpose(-2, -1))
+        for _ in range(iters):
+            B_isqrt = invsqrtm_hpd(B.unsqueeze(0))[0]  # B^{-1/2}
+            B_sqrt = sqrtm_hpd(B.unsqueeze(0))[0]      # B^{1/2}
+            # 白化: whitened_i = B^{-1/2} X_i B^{-1/2}
+            whitened = hpd_congruence(B_isqrt, X)      # (B,n,n)
+            # 切空间平均: (1/N) Σ log(whitened_i)
+            tangent_mean = log_mat_v2(whitened).mean(dim=0, keepdim=True)  # (1,n,n)
+            # 指数映射回流形: B ← B^{1/2} exp(tangent_mean) B^{1/2}
+            B = hpd_congruence(B_sqrt, exp_mat_v2(tangent_mean))[0]
+            B = 0.5 * (B + B.conj().transpose(-2, -1))
+    return B
+
+
+def hpd_geodesic(A, C, t):
+    """AIM 测地线插值 γ(t), γ(0)=A, γ(1)=C, A/C HPD (无梯度)。
+
+    γ(t) = A^{1/2} (A^{-1/2} C A^{-1/2})^t A^{1/2}
+    用于 running mean 的黎曼动量更新 (在流形上而非欧氏空间做插值)。
+
+    Args:
+        A, C: (n,n) complex HPD
+        t:    float in [0,1]
+    Returns:
+        (n,n) complex HPD
+    """
+    with torch.no_grad():
+        A = A.unsqueeze(0)
+        C = C.unsqueeze(0)
+        A_isqrt = invsqrtm_hpd(A)
+        A_sqrt = sqrtm_hpd(A)
+        mid = hpd_congruence(A_isqrt[0], C)          # A^{-1/2} C A^{-1/2}
+        mid_t = exp_mat_v2(t * log_mat_v2(mid))      # (·)^t
+        out = hpd_congruence(A_sqrt[0], mid_t)[0]
+        out = 0.5 * (out + out.conj().transpose(-2, -1))
+    return out
+
+
+def update_para_riemann_hpd(G, dLdG, t):
+    """HPD 流形上一步黎曼梯度下降 (仿射不变度量), 对标 Stiefel 的 update_para_riemann。
+
+    可学 HPD 偏置 G 的更新。给定欧氏梯度 dL/dG (对 G 本身求导, 因 G 直接以参数存储):
+      1. 黎曼梯度 (AIM): grad_R = G · herm(dL/dG) · G   (欧氏梯度 → 切空间黎曼梯度)
+      2. 指数映射回缩: G_new = G^{1/2} exp( -t · G^{-1/2} grad_R G^{-1/2} ) G^{1/2}
+                     = G^{1/2} exp( -t · G^{1/2} herm(dL/dG) G^{1/2} ) G^{1/2}
+         保证 G_new 精确落在 HPD 流形上 (同余 + 正定谱)。
+
+    与 Stiefel update_para_riemann 的对应:
+      cal_riemann_grad   ↔  grad_R = G herm(dL/dG) G
+      cal_retraction(QR) ↔  指数映射回缩 (谱域, 严格保 HPD)
+
+    Args:
+        G:    (n,n) complex HPD, 当前偏置
+        dLdG: (n,n) complex, 损失对 G 的欧氏梯度
+        t:    float, 步长
+    Returns:
+        (n,n) complex HPD, 更新后的 G
+    """
+    with torch.no_grad():
+        n = G.shape[0]
+        G = 0.5 * (G + G.conj().T)
+        S = 0.5 * (dLdG + dLdG.conj().T)             # herm(dL/dG)
+        G_sqrt = sqrtm_hpd(G.unsqueeze(0))[0]        # G^{1/2}
+        # 回缩指数的自变量: -t · G^{1/2} S G^{1/2}  (Hermitian)
+        arg = -t * (G_sqrt @ S @ G_sqrt)
+        arg = 0.5 * (arg + arg.conj().T)
+        expo = exp_mat_v2(arg.unsqueeze(0))[0]       # exp(arg), HPD
+        G_new = G_sqrt @ expo @ G_sqrt               # G^{1/2} exp(arg) G^{1/2}, HPD
+        G_new = 0.5 * (G_new + G_new.conj().T)
+        # 严格 PD 投影: 理论上 G_new 已是 HPD, 但高条件数下 matmul 浮点误差
+        # 可能把接近零的特征值压成微小负数, 导致下次 sqrtm=exp(0.5 log G) 对负特征值取 log → NaN。
+        # 用 eigh 把特征值 clamp 到正下限, 重建, 保证严格留在 HPD 流形。
+        ev, V = torch.linalg.eigh(G_new)
+        ev = ev.real.clamp(min=1e-10)
+        G_new = (V * ev.to(V.dtype).unsqueeze(-2)) @ V.conj().T
+        G_new = 0.5 * (G_new + G_new.conj().T)
+    return G_new
 
 
 

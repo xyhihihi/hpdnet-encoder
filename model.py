@@ -4,9 +4,69 @@ import torch.nn.functional as F
 import util as util
 
 
+class HPDRiemannianBatchNorm(torch.nn.Module):
+    """HPD 矩阵的黎曼 Batch Normalization (Brooks et al., NeurIPS 2019)。
+
+    在仿射不变度量 (Affine-Invariant Metric) 下, 对一批 HPD 矩阵做:
+      1. 黎曼居中 (ReCentering): 计算 batch 的 Fréchet/Karcher 均值 B,
+         白化每个样本 X̄_i = B^{-1/2} X_i B^{-1/2} (把 batch 均值搬到单位阵 I)。
+      2. 黎曼偏置 (ReBiasing):   搬到可学 HPD 参数 G 上 Y_i = G^{1/2} X̄_i G^{1/2}。
+         G 初始化为单位阵 I ⇒ 初始 BN ≈ 恒等。
+      3. running mean: 训练时用 AIM 测地线动量更新 B_run; 推理时用 B_run 居中。
+
+    所有操作是 HPD 的同余变换 (P X P^H), 结构性保证输出仍是 HPD — 不离开流形。
+    G 不走欧氏 autograd 更新, 而是在 update_para 里用 util.update_para_riemann_hpd
+    做 HPD 流形上的黎曼 SGD (对标 Stiefel 权重的 util.update_para_riemann)。
+    """
+
+    def __init__(self, dim, momentum=0.1, karcher_iters=1, eps=1e-8):
+        super(HPDRiemannianBatchNorm, self).__init__()
+        self.dim = dim
+        self.momentum = momentum
+        self.karcher_iters = karcher_iters
+        self.eps = eps
+
+        # 可学 HPD 偏置 G, 初始 = I (BN 初始为恒等)。作为参数直接存 HPD 矩阵,
+        # 由 update_para 中的 update_para_riemann_hpd 保证更新后仍是 HPD。
+        G_init = torch.eye(dim, dtype=torch.complex128)
+        self.G = torch.nn.Parameter(G_init, requires_grad=True)
+
+        # running mean (HPD 流形上的黎曼均值), 推理用。初始 = I。
+        self.register_buffer('running_mean', torch.eye(dim, dtype=torch.complex128))
+        self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
+
+    def forward(self, X):
+        """X: (B, dim, dim) complex128 HPD → (B, dim, dim) complex128 HPD。"""
+        if self.training:
+            # batch 黎曼均值 (无梯度统计量)
+            B_mean = util.hpd_karcher_mean(X, iters=self.karcher_iters)
+            center = B_mean
+            # 更新 running mean (AIM 测地线动量, 无梯度)
+            with torch.no_grad():
+                self.num_batches_tracked += 1
+                if self.num_batches_tracked == 1:
+                    self.running_mean = B_mean.clone()
+                else:
+                    self.running_mean = util.hpd_geodesic(
+                        self.running_mean, B_mean, self.momentum)
+        else:
+            center = self.running_mean
+
+        # 1. 黎曼居中: X̄ = B^{-1/2} X B^{-1/2}  (B = batch 均值或 running mean, detach)
+        center = center.detach()
+        B_isqrt = util.invsqrtm_hpd(center.unsqueeze(0))[0]
+        X_centered = util.hpd_congruence(B_isqrt, X)
+
+        # 2. 黎曼偏置: Y = G^{1/2} X̄ G^{1/2}  (G 可学 HPD)
+        G_sqrt = util.sqrtm_hpd(self.G.unsqueeze(0))[0]
+        Y = util.hpd_congruence(G_sqrt, X_centered)
+        return Y
+
+
 class HPDNetwork(torch.nn.Module):
     def __init__(self, in_dim=64, hidden_dims=None, rec_params=None,
-                 activations=None, rec_N_params=None, skip_resolutions=None):
+                 activations=None, rec_N_params=None, skip_resolutions=None,
+                 use_bn=True, bn_momentum=0.1, bn_karcher_iters=1, bn_lr_scale=0.1):
         super(HPDNetwork, self).__init__()
 
         if hidden_dims is None:
@@ -49,6 +109,19 @@ class HPDNetwork(torch.nn.Module):
 
         # encoder 层索引 → 该层输出分辨率
         enc_out_res_to_idx = {dims[i + 1]: i for i in range(len(hidden_dims))}
+
+        # 黎曼 BatchNorm (Brooks 2019): 每个 encoder 层的 ReEig 之后接一个 HPD-BN
+        # G 用 HPD 流形黎曼 SGD 更新, 步长 = LR * bn_lr_scale (AIM 指数回缩需比 QR 更小的步长)
+        self.use_bn = use_bn
+        self.bn_lr_scale = bn_lr_scale
+        if use_bn:
+            self.bn_layers = torch.nn.ModuleList([
+                HPDRiemannianBatchNorm(dims[i + 1], momentum=bn_momentum,
+                                       karcher_iters=bn_karcher_iters)
+                for i in range(len(hidden_dims))
+            ])
+        else:
+            self.bn_layers = None
 
         # Build encoder layers: down, W^H X W + (v2 或 v3)
         # v2 调用签名: rec_mat_v2(X, eps) — 用 layer['param']
@@ -152,13 +225,16 @@ class HPDNetwork(torch.nn.Module):
         X = input
         layer_outputs = []
 
-        # Encoder: 下行 64 → 4, 每层 W^H X W + (v2 或 v3)
-        for layer in self.enc_layers:
+        # Encoder: 下行 64 → 4, 每层 W^H X W + (v2 或 v3) + 黎曼 BN
+        for idx, layer in enumerate(self.enc_layers):
             X = self._build_layer(X, layer)
             if layer['activation'] == util.rec_mat_v3:
                 X = layer['activation'](X, layer['param'], layer['N'])
             else:
                 X = layer['activation'](X, layer['param'])
+            # 黎曼 BatchNorm (Brooks 2019): ReEig 后 X 已是 HPD, logm 安全
+            if self.use_bn:
+                X = self.bn_layers[idx](X)
             layer_outputs.append(X)
 
         # Decoder: 上行 4 → 64, 每层 线性 U^H block_diag(X, c·I) U → 多项式非线性 → skip 加法
@@ -197,6 +273,18 @@ class HPDNetwork(torch.nn.Module):
         for theta in self.poly_thetas:
             theta.data -= lr * theta.grad.data
             theta.grad.data.zero_()
+
+        # 更新黎曼 BN 的可学 HPD 偏置 G (HPD 流形黎曼 SGD, Brooks 2019)
+        # 对标 Stiefel 权重的 update_para_riemann: 欧氏梯度 → AIM 黎曼梯度 → 指数映射回缩,
+        # 严格保证 G 留在 HPD 流形上。步长比 QR 回缩更保守 (lr * bn_lr_scale)。
+        if self.use_bn:
+            bn_lr = lr * self.bn_lr_scale
+            for bn in self.bn_layers:
+                if bn.G.grad is not None:
+                    G_new = util.update_para_riemann_hpd(
+                        bn.G.data, bn.G.grad.data, bn_lr)
+                    bn.G.data.copy_(G_new)
+                    bn.G.grad.data.zero_()
 
         # 清除 Stiefel 权重梯度 (顺序: 1 → n)
         for i in range(0, len(self.weights)):
