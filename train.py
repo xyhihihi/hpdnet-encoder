@@ -26,7 +26,7 @@ os.makedirs(CURVE_SAVE_DIR, exist_ok=True)
 # ==============================================
 DATA_DIR = 'D:/data/customed/customed_64'
 FILE_LIST_PATH = 'D:/data/customed/train.txt'
-SAVE_PATH = 'tmp/customed/saved/autoencoder2.model'
+SAVE_PATH = 'tmp/customed/saved/autoencoder.model'
 LOAD_WEIGHT_PATH = SAVE_PATH
 LOAD_WEIGHT = False
 
