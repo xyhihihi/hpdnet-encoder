@@ -34,6 +34,12 @@ BATCH_SIZE = 4096
 EPOCHS = 400
 LR = 10
 
+# denoising AE: 是否对输入做特征值损坏 (每样本随机压 N_MASK 个特征值到 MASK_EPS)
+# 目标仍是干净 X, 逼模型从损坏版重建。损坏保持 HPD, 不离开流形 (见 util.mask_random_eigvals)。
+USE_EIGVAL_MASK = True    # True 开启特征值损坏 (denoising 模式)
+N_MASK = 8                # 每样本损坏的特征值个数 (对 64x64 约 12.5%)
+MASK_EPS = 1e-8           # 被损坏特征值替换成的极小正值
+
 # ==============================================
 # 加载文件列表 (标签不参与训练, 只取文件名)
 # ==============================================
@@ -88,13 +94,13 @@ for epoch in range(EPOCHS):
         X = torch.from_numpy(batch_data).to(torch.complex128)
         X.requires_grad = False
 
-        # # 输入损坏：denoising AE，每个样本随机压 n 个特征值到 eps；目标仍是干净 X
-        # X_noisy = util.mask_random_eigvals(X,8,1e-8)
-        # # 前向
-        # Y, _ = model(X_noisy)
-
-        # 前向
-        Y, _ = model(X)
+        # 前向 (可选 denoising: 输入损坏, 目标仍是干净 X)
+        if USE_EIGVAL_MASK:
+            # 每个样本随机压 N_MASK 个特征值到 MASK_EPS; 损坏保 HPD, 不离流形
+            X_input = util.mask_random_eigvals(X, N_MASK, MASK_EPS)
+        else:
+            X_input = X
+        Y, _ = model(X_input)
 
         # Log-Euclidean loss: ||logm(Y) - logm(X)||_F^2, mean reduction
         log_Y = util.log_mat_v2(Y)
