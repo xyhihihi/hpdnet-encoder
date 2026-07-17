@@ -1,6 +1,7 @@
 # 训练脚本: U 型 HPD 自编码器
 # 任务: 输入 64x64 HPD 矩阵 X, 重建 Y = X, loss = Log-Euclidean 距离
 import os
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -30,9 +31,23 @@ SAVE_PATH = 'tmp/customed/saved/autoencoder.model'
 LOAD_WEIGHT_PATH = SAVE_PATH
 LOAD_WEIGHT = False
 
-BATCH_SIZE = 4096
+BATCH_SIZE = 512
 EPOCHS = 400
-LR = 10
+
+# 学习率策略 (实验结论): 主 LR 与 BN 偏置 G 的步长解耦, 各自余弦衰减。
+# - 主 LR 驱动 Stiefel 权重 + decoder theta; bn_lr 驱动黎曼 BN 的 HPD 偏置 G (util.update_para_riemann_hpd)
+# - 实验表明 G 步长严重影响早期收敛速度 (最优 ~200), 主 LR 影响后期精修 (最优 ~40)
+# - 余弦衰减 (main 40→0.5, bn 200→5) 相比固定 LR 平台再降约 36%, 且比阶梯衰减更平滑稳定
+MAIN_LR_HI = 40.0    # 主 LR 起点
+MAIN_LR_LO = 0.5     # 主 LR 终点
+BN_LR_HI = 200.0     # bn_lr 起点 (G 的独立绝对步长)
+BN_LR_LO = 5.0       # bn_lr 终点
+
+
+def cosine_lr(hi, lo, epoch, total):
+    """余弦衰减: epoch=0 → hi, epoch=total-1 → lo。"""
+    t = epoch / max(total - 1, 1)  # 0..1
+    return lo + 0.5 * (hi - lo) * (1 + math.cos(math.pi * t))
 
 # denoising AE: 是否对输入做特征值损坏 (每样本随机压 N_MASK 个特征值到 MASK_EPS)
 # 目标仍是干净 X, 逼模型从损坏版重建。损坏保持 HPD, 不离开流形 (见 util.mask_random_eigvals)。
@@ -56,7 +71,7 @@ print(f'训练样本数: {num_samples}')
 # ==============================================
 # 初始化模型
 # ==============================================
-model = model.HPDNetwork()
+model = model.HPDNetwork(use_bn=True, bn_lr=BN_LR_HI)
 
 if LOAD_WEIGHT and os.path.exists(LOAD_WEIGHT_PATH):
     print(f"开始加载已有模型权重: {LOAD_WEIGHT_PATH}")
@@ -76,6 +91,9 @@ model.train()
 # ==============================================
 for epoch in range(EPOCHS):
     epoch_start = datetime.datetime.now()
+    # 本 epoch 的余弦衰减学习率 (主 LR 与 bn_lr 各自解耦衰减)
+    main_lr = cosine_lr(MAIN_LR_HI, MAIN_LR_LO, epoch, EPOCHS)
+    bn_lr = cosine_lr(BN_LR_HI, BN_LR_LO, epoch, EPOCHS)
     # 每个 epoch 打乱顺序
     perm = np.random.permutation(num_samples)
     epoch_loss = 0.0
@@ -111,7 +129,7 @@ for epoch in range(EPOCHS):
         # 反向 + Riemannian 更新
         model.zero_grad()
         loss.backward()
-        model.update_para(LR)
+        model.update_para(main_lr, bn_lr=bn_lr)
 
         epoch_loss += loss.item()
         num_batches += 1
@@ -119,7 +137,7 @@ for epoch in range(EPOCHS):
     # 更新 Loss
     avg_loss = epoch_loss / max(num_batches, 1)
     elapsed = (datetime.datetime.now() - epoch_start).total_seconds()
-    print(f'epoch {epoch + 1}/{EPOCHS} loss={avg_loss:.6f} time={elapsed:.1f}s')
+    print(f'epoch {epoch + 1}/{EPOCHS} loss={avg_loss:.6f} main_lr={main_lr:.3f} bn_lr={bn_lr:.2f} time={elapsed:.1f}s')
     train_loss_history.append(avg_loss)
     # 清空画布重绘
     loss_ax.clear()

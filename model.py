@@ -66,7 +66,7 @@ class HPDRiemannianBatchNorm(torch.nn.Module):
 class HPDNetwork(torch.nn.Module):
     def __init__(self, in_dim=64, hidden_dims=None, rec_params=None,
                  activations=None, rec_N_params=None, skip_resolutions=None,
-                 use_bn=True, bn_momentum=0.1, bn_karcher_iters=1, bn_lr_scale=0.1):
+                 use_bn=True, bn_momentum=0.1, bn_karcher_iters=1, bn_lr=1.0):
         super(HPDNetwork, self).__init__()
 
         if hidden_dims is None:
@@ -111,9 +111,10 @@ class HPDNetwork(torch.nn.Module):
         enc_out_res_to_idx = {dims[i + 1]: i for i in range(len(hidden_dims))}
 
         # 黎曼 BatchNorm (Brooks 2019): 每个 encoder 层的 ReEig 之后接一个 HPD-BN
-        # G 用 HPD 流形黎曼 SGD 更新, 步长 = LR * bn_lr_scale (AIM 指数回缩需比 QR 更小的步长)
+        # G 的更新用独立绝对学习率 bn_lr (与主 LR 解耦; AIM 指数回缩需要的最优步长
+        # 与 Stiefel 权重的 QR 回缩不同, 故单独调)。update_para 也可按调用覆盖 bn_lr。
         self.use_bn = use_bn
-        self.bn_lr_scale = bn_lr_scale
+        self.bn_lr = bn_lr
         if use_bn:
             self.bn_layers = torch.nn.ModuleList([
                 HPDRiemannianBatchNorm(dims[i + 1], momentum=bn_momentum,
@@ -254,7 +255,7 @@ class HPDNetwork(torch.nn.Module):
 
         return X, layer_outputs
 
-    def update_para(self, lr):
+    def update_para(self, lr, bn_lr=None):
         # 获取所有权重的梯度 (顺序: 1 → n)
         egrads = [w_p.grad.data.numpy() for w_p in self.weights]
         ws = [w_p.data.numpy() for w_p in self.weights]
@@ -276,13 +277,13 @@ class HPDNetwork(torch.nn.Module):
 
         # 更新黎曼 BN 的可学 HPD 偏置 G (HPD 流形黎曼 SGD, Brooks 2019)
         # 对标 Stiefel 权重的 update_para_riemann: 欧氏梯度 → AIM 黎曼梯度 → 指数映射回缩,
-        # 严格保证 G 留在 HPD 流形上。步长比 QR 回缩更保守 (lr * bn_lr_scale)。
+        # 严格保证 G 留在 HPD 流形上。G 用独立绝对学习率 (与主 lr 解耦), 可按调用覆盖。
         if self.use_bn:
-            bn_lr = lr * self.bn_lr_scale
+            g_lr = self.bn_lr if bn_lr is None else bn_lr
             for bn in self.bn_layers:
                 if bn.G.grad is not None:
                     G_new = util.update_para_riemann_hpd(
-                        bn.G.data, bn.G.grad.data, bn_lr)
+                        bn.G.data, bn.G.grad.data, g_lr)
                     bn.G.data.copy_(G_new)
                     bn.G.grad.data.zero_()
 
