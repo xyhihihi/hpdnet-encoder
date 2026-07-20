@@ -1,3 +1,6 @@
+# IDE
+.idea/
+
 # 字节码
 __pycache__/
 *.pyc
@@ -12,6 +15,7 @@ tmp/
 _approach_*.py
 _approach_*.txt
 _approach_*.log
+_lr_sweep.py
 _lr_sweep_result.txt
 _lr_sweep_stdout.log
 train_bs*.log
