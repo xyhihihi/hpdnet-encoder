@@ -32,7 +32,7 @@ LOAD_WEIGHT_PATH = SAVE_PATH
 LOAD_WEIGHT = False
 
 BATCH_SIZE = 512
-EPOCHS = 400
+EPOCHS = 500
 
 # 学习率策略 (实验结论): 主 LR 与 BN 偏置 G 的步长解耦, 各自余弦衰减。
 # - 主 LR 驱动 Stiefel 权重 + decoder theta; bn_lr 驱动黎曼 BN 的 HPD 偏置 G (util.update_para_riemann_hpd)
@@ -52,7 +52,7 @@ def cosine_lr(hi, lo, epoch, total):
 # denoising AE: 是否对输入做特征值损坏 (每样本随机压 N_MASK 个特征值到 MASK_EPS)
 # 目标仍是干净 X, 逼模型从损坏版重建。损坏保持 HPD, 不离开流形 (见 util.mask_random_eigvals)。
 USE_EIGVAL_MASK = True    # True 开启特征值损坏 (denoising 模式)
-N_MASK = 8                # 每样本损坏的特征值个数 (对 64x64 约 12.5%)
+N_MASK = 16               # 每样本损坏的特征值个数 (实验结论: 16比8更能覆盖测试集病态分布)
 MASK_EPS = 1e-8           # 被损坏特征值替换成的极小正值
 
 # ==============================================
@@ -71,7 +71,9 @@ print(f'训练样本数: {num_samples}')
 # ==============================================
 # 初始化模型
 # ==============================================
-model = model.HPDNetwork(use_bn=True, bn_lr=BN_LR_HI)
+REC_EPS = 1e-4   # ReEig 特征值夹断阈值 (实验结论: 1e-4 比原 1e-6 更能抑制病态传播)
+model = model.HPDNetwork(use_bn=True, bn_lr=BN_LR_HI,
+                         rec_params=[REC_EPS] * 24)
 
 if LOAD_WEIGHT and os.path.exists(LOAD_WEIGHT_PATH):
     print(f"开始加载已有模型权重: {LOAD_WEIGHT_PATH}")
@@ -160,6 +162,12 @@ for epoch in range(EPOCHS):
     os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
     torch.save(model, SAVE_PATH)
     print(f'模型已保存到 {SAVE_PATH}')
+
+    # 每 100 轮额外保存一个带轮数的快照 (autoencoder_epoch100.model 等)
+    if (epoch + 1) % 100 == 0:
+        snap_path = SAVE_PATH.replace('.model', f'_epoch{epoch + 1}.model')
+        torch.save(model, snap_path)
+        print(f'快照已保存到 {snap_path}')
 
 
 
