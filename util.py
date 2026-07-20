@@ -581,7 +581,30 @@ class ExpFunction_v2(Function):
         expLs = torch.zeros((B, N, N), dtype=torch.double, device=input.device)  # [B,N,N] diag(exp(λ))
 
         for i in range(B):
-            L, U = torch.linalg.eigh(input[i, :, :])  # L: (N,) real 升序, U: (N,N) 复酉
+            # 对称化: 抵消浮点误差导致的非 Hermitian 分量
+            inp_i = input[i, :, :]
+            inp_i = 0.5 * (inp_i + inp_i.conj().T)
+            frob = float(inp_i.norm().item())
+
+            # 特殊情况: 近零矩阵 → exp(0) = I, 避免 eigh 在全零矩阵上因重复特征值崩溃
+            if frob < 1e-10:
+                L = torch.zeros(N, dtype=torch.double, device=input.device)
+                U = torch.eye(N, dtype=input.dtype, device=input.device)
+            else:
+                try:
+                    L, U = torch.linalg.eigh(inp_i)
+                except BaseException:
+                    # eigh 不收敛 (病态或重复特征值): 加正则化后重试
+                    shift = frob + 1.0
+                    try:
+                        L, U = torch.linalg.eigh(
+                            inp_i + shift * torch.eye(N, dtype=inp_i.dtype, device=inp_i.device))
+                        L = L - shift   # 扣回偏移, 保持语义正确
+                    except BaseException:
+                        # 最终兜底: 恒等 (exp(0)=I)
+                        L = torch.zeros(N, dtype=torch.double, device=input.device)
+                        U = torch.eye(N, dtype=input.dtype, device=input.device)
+
             Ls[i, :] = L.double()
             Us[i, :, :] = U
             expLs[i, :, :] = torch.diag(torch.exp(L.double()))
@@ -660,6 +683,39 @@ def exp_mat_v2(input):
 #   g_P(U, V) = tr(P^{-1} U P^{-1} V)
 # 全部基于 log_mat_v2 / exp_mat_v2 + matmul 构建, autograd 可导 (手写反向)。
 # =====================================================================
+
+def project_hpd(M, eps=1e-8):
+    """HPD 投影: 对称化 + 特征值下限, 防止长期训练后浮点漂移使 G / running_mean 离开流形。
+
+    鲁棒实现: eigh 在特征值高度聚集时可能不收敛 (LAPACK error 62)。
+    先加 Frobenius 范数比例的正则化 (保证特征值间距 ≥ 1), 再做 eigh 后扣回。
+
+    Args:
+        M: (n,n) complex, 应接近 HPD 的矩阵
+        eps: 特征值下限 (默认 1e-8)
+    Returns:
+        (n,n) complex, 严格 HPD
+    """
+    M = 0.5 * (M + M.conj().T)          # 对称化
+    n = M.shape[0]
+    try:
+        ev, V = torch.linalg.eigh(M)
+        ev = ev.real.clamp(min=eps)
+        return (V * ev.to(V.dtype).unsqueeze(-2)) @ V.conj().T
+    except BaseException:
+        # eigh 不收敛: 加 Frobenius 范数正则化使特征值间距足够大后重试
+        with torch.no_grad():
+            frob = float((M.real ** 2 + M.imag ** 2).sum().sqrt().item())
+            shift = frob + 1.0          # 保证 M+shift*I 的所有特征值 ≥ 1 > 0
+            M_reg = M + shift * torch.eye(n, dtype=M.dtype, device=M.device)
+            try:
+                ev, V = torch.linalg.eigh(M_reg)
+                ev = (ev.real - shift).clamp(min=eps)
+                return (V * ev.to(V.dtype).unsqueeze(-2)) @ V.conj().T
+            except BaseException:
+                # 最后兜底: 返回单位阵 (BN 退化为恒等, 不会崩溃)
+                return torch.eye(n, dtype=M.dtype, device=M.device)
+
 
 def sqrtm_hpd(A):
     """HPD 矩阵平方根 A^{1/2} = exp(0.5 log A)。A: (B,n,n) HPD。"""

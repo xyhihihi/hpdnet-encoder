@@ -27,7 +27,7 @@ os.makedirs(LOSS_CURVE_SAVE_DIR, exist_ok=True)
 # ==============================================
 DATA_DIR = 'D:/data/customed/customed_64'
 FILE_LIST_PATH = 'D:/data/customed/test.txt'
-MODEL_PATH = 'tmp/customed/saved/autoencoder1.model'
+MODEL_PATH = 'tmp/customed/saved/autoencoder_epoch500.model'
 
 # ★ 标签 1 → middlefeature0.mat, 标签 2 → middlefeature1.mat ★
 SAVE_PATH_0 = 'D:/matlabcode/HPDNet-fpn/middlefeature0.mat'   # 原始标签 = 1
@@ -92,10 +92,16 @@ with torch.no_grad():
         X_low_list.append(X_low.detach())
 
         # ---------- 逐样本 Log-Euclidean Loss ----------
-        log_Y = util.log_mat_v2(Y)
-        log_X = util.log_mat_v2(X)
-        diff = log_Y - log_X
-        per_sample_loss = (diff.real ** 2 + diff.imag ** 2).mean(dim=(-2, -1))
+        # 注意: 训练后 decoder 重建 Y 对部分样本可能极度病态, log_mat_v2 内部 SVD 可能不收敛。
+        # 特征提取 (layer_outputs[11]) 不受影响, loss 计算用 try/except 兜底。
+        try:
+            log_Y = util.log_mat_v2(Y)
+            log_X = util.log_mat_v2(X)
+            diff = log_Y - log_X
+            per_sample_loss = (diff.real ** 2 + diff.imag ** 2).mean(dim=(-2, -1))
+        except Exception:
+            # SVD 不收敛时用 NaN 填充 loss (不影响特征保存)
+            per_sample_loss = torch.full((actual_bs,), float('nan'), dtype=torch.double)
         per_sample_loss_np = per_sample_loss.numpy()
         all_sample_losses.append(per_sample_loss_np)
 

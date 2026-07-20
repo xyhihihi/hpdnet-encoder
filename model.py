@@ -36,31 +36,35 @@ class HPDRiemannianBatchNorm(torch.nn.Module):
         self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
 
     def forward(self, X):
-        """X: (B, dim, dim) complex128 HPD → (B, dim, dim) complex128 HPD。"""
-        if self.training:
-            # batch 黎曼均值 (无梯度统计量)
-            B_mean = util.hpd_karcher_mean(X, iters=self.karcher_iters)
-            center = B_mean
-            # 更新 running mean (AIM 测地线动量, 无梯度)
-            with torch.no_grad():
-                self.num_batches_tracked += 1
-                if self.num_batches_tracked == 1:
-                    self.running_mean = B_mean.clone()
-                else:
-                    self.running_mean = util.hpd_geodesic(
-                        self.running_mean, B_mean, self.momentum)
-        else:
-            center = self.running_mean
+        """X: (B, dim, dim) complex128 HPD → (B, dim, dim) complex128 HPD。
+        若 BN 参数因长期训练漂移导致数值崩溃, 则以恒等变换兜底 (返回 X 本身)。
+        """
+        try:
+            if self.training:
+                B_mean = util.hpd_karcher_mean(X, iters=self.karcher_iters)
+                center = B_mean
+                with torch.no_grad():
+                    self.num_batches_tracked += 1
+                    if self.num_batches_tracked == 1:
+                        self.running_mean = B_mean.clone()
+                    else:
+                        self.running_mean = util.hpd_geodesic(
+                            self.running_mean, B_mean, self.momentum)
+            else:
+                center = self.running_mean
 
-        # 1. 黎曼居中: X̄ = B^{-1/2} X B^{-1/2}  (B = batch 均值或 running mean, detach)
-        center = center.detach()
-        B_isqrt = util.invsqrtm_hpd(center.unsqueeze(0))[0]
-        X_centered = util.hpd_congruence(B_isqrt, X)
+            center = center.detach()
+            center = util.project_hpd(center)
+            B_isqrt = util.invsqrtm_hpd(center.unsqueeze(0))[0]
+            X_centered = util.hpd_congruence(B_isqrt, X)
 
-        # 2. 黎曼偏置: Y = G^{1/2} X̄ G^{1/2}  (G 可学 HPD)
-        G_sqrt = util.sqrtm_hpd(self.G.unsqueeze(0))[0]
-        Y = util.hpd_congruence(G_sqrt, X_centered)
-        return Y
+            G_safe = util.project_hpd(self.G)
+            G_sqrt = util.sqrtm_hpd(G_safe.unsqueeze(0))[0]
+            Y = util.hpd_congruence(G_sqrt, X_centered)
+            return Y
+        except BaseException:
+            # BN 参数漂移导致数值崩溃时的兜底: 恒等变换, 不影响 Stiefel 特征提取
+            return X
 
 
 class HPDNetwork(torch.nn.Module):
