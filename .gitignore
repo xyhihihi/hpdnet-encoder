@@ -1,0 +1,18 @@
+# 字节码
+__pycache__/
+*.pyc
+
+# 训练产物 (权重、loss曲线、日志)
+tmp/
+*.log
+*.model
+*.mat
+
+# 临时实验文件
+_approach_*.py
+_approach_*.txt
+_approach_*.log
+_lr_sweep_result.txt
+_lr_sweep_stdout.log
+train_bs*.log
+train_v2.log
