@@ -42,6 +42,10 @@ MAIN_LR_LO = 0.5
 BN_LR_HI = 200.0
 BN_LR_LO = 5.0
 
+# 特征值归一化预处理 (实验结论: Det 归一化使 loss 降低 ~90%)
+# 可选: 'det' / 'trace' / 'maxeig' / 'logcenter' / None (关闭)
+EIGVAL_NORM = None
+
 # denoising AE 配置
 USE_EIGVAL_MASK = True
 N_MASK = 16
@@ -72,6 +76,45 @@ def norm_det(X):
     return X / scale
 
 
+def norm_trace(X):
+    """Trace 归一化: X * n / tr(X), 使 tr(X_norm) = n。"""
+    n = X.shape[-1]
+    tr = torch.diagonal(X, dim1=-2, dim2=-1).sum(dim=-1, keepdim=True).unsqueeze(-1).real
+    return X * (n / tr)
+
+
+def norm_maxeig(X):
+    """Max-eig 归一化: X / λ_max(X), 使最大特征值 = 1。"""
+    with torch.no_grad():
+        ev = torch.linalg.eigvalsh(X)
+        max_ev = ev[:, -1:].unsqueeze(-1)
+    return X / max_ev
+
+
+def norm_logcenter(X):
+    """Log 域居中: X / exp(全局 log 特征值均值)。需先计算全局统计量。"""
+    with torch.no_grad():
+        ev = torch.linalg.eigvalsh(X)  # [B, n]
+        global_mean = torch.log(ev).mean()
+    return X / torch.exp(global_mean)
+
+
+def apply_eigval_norm(X, method):
+    """统一入口: 根据 method 字符串选择归一化方式。"""
+    if method is None or method == 'none':
+        return X
+    elif method == 'det':
+        return norm_det(X)
+    elif method == 'trace':
+        return norm_trace(X)
+    elif method == 'maxeig':
+        return norm_maxeig(X)
+    elif method == 'logcenter':
+        return norm_logcenter(X)
+    else:
+        raise ValueError(f"未知归一化方法: {method}, 可选: det/trace/maxeig/logcenter/None")
+
+
 # ==============================================
 # 加载文件列表
 # ==============================================
@@ -86,18 +129,21 @@ num_samples = len(file_list)
 print(f'训练样本数: {num_samples}')
 
 # ==============================================
-# 预载入数据到内存 + Det 归一化
+# 预载入数据到内存 + 特征值归一化
 # ==============================================
 print('预载入数据到内存...', flush=True)
 all_data = np.zeros((num_samples, 64, 64), dtype=np.complex128)
 for i, f in enumerate(file_list):
     all_data[i] = sio.loadmat(os.path.join(DATA_DIR, f))['Y1']
 all_X_raw = torch.from_numpy(all_data).to(torch.complex128)
-print('数据载入完成, 开始 Det 归一化...', flush=True)
+print(f'数据载入完成。特征值归一化: {EIGVAL_NORM}', flush=True)
 
-# Det 归一化: 对全部数据预计算
-all_X = norm_det(all_X_raw)
-print(f'Det 归一化完成。归一化后样本0: tr={torch.diagonal(all_X[0], dim1=-2, dim2=-1).sum().real:.4f}', flush=True)
+# 特征值归一化 (可开关)
+all_X = apply_eigval_norm(all_X_raw, EIGVAL_NORM)
+if EIGVAL_NORM and EIGVAL_NORM != 'none':
+    print(f'{EIGVAL_NORM} 归一化完成。样本0: tr={torch.diagonal(all_X[0], dim1=-2, dim2=-1).sum().real:.4f}', flush=True)
+else:
+    print('归一化已关闭, 使用原始数据。', flush=True)
 
 # ==============================================
 # 初始化模型 + 断点续训

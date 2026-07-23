@@ -92,16 +92,10 @@ with torch.no_grad():
         X_low_list.append(X_low.detach())
 
         # ---------- 逐样本 Log-Euclidean Loss ----------
-        # 注意: 训练后 decoder 重建 Y 对部分样本可能极度病态, log_mat_v2 内部 SVD 可能不收敛。
-        # 特征提取 (layer_outputs[11]) 不受影响, loss 计算用 try/except 兜底。
-        try:
-            log_Y = util.log_mat_v2(Y)
-            log_X = util.log_mat_v2(X)
-            diff = log_Y - log_X
-            per_sample_loss = (diff.real ** 2 + diff.imag ** 2).mean(dim=(-2, -1))
-        except Exception:
-            # SVD 不收敛时用 NaN 填充 loss (不影响特征保存)
-            per_sample_loss = torch.full((actual_bs,), float('nan'), dtype=torch.double)
+        log_Y = util.log_mat_v2(Y)
+        log_X = util.log_mat_v2(X)
+        diff = log_Y - log_X
+        per_sample_loss = (diff.real ** 2 + diff.imag ** 2).mean(dim=(-2, -1))
         per_sample_loss_np = per_sample_loss.numpy()
         all_sample_losses.append(per_sample_loss_np)
 
